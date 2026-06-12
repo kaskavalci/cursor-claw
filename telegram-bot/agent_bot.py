@@ -23,6 +23,8 @@ from datetime import datetime
 from typing import Optional, Tuple
 
 TYPING_INTERVAL = 4  # Telegram typing indicator lasts ~5s; re-send before it expires
+RICH_CHUNK = 32768  # sendRichMessage limit
+PLAIN_CHUNK = 4096  # sendMessage limit
 DEFAULT_AGENT_TIMEOUT = 0  # 0 = unlimited; set CURSOR_AGENT_TIMEOUT in config or env to limit
 
 BASE = "https://api.telegram.org/bot"
@@ -137,17 +139,24 @@ def collapse_blank_lines(text: str) -> str:
     return "\n".join(result)
 
 
-def send_message(token, chat_id, text, parse_mode="Markdown"):
-    chunk = 4096
-    for i in range(0, len(text), chunk):
-        part = text[i : i + chunk]
-        try:
-            api(token, "sendMessage", chat_id=chat_id, text=part, parse_mode=parse_mode)
-        except urllib.error.HTTPError as e:
-            if e.code == 400 and parse_mode:
-                api(token, "sendMessage", chat_id=chat_id, text=part)
-            else:
-                raise
+def send_message(token, chat_id, text, *, use_rich=True):
+    """Send text to Telegram. Agent replies use sendRichMessage (GFM); system text uses plain sendMessage."""
+    chunk_size = RICH_CHUNK if use_rich else PLAIN_CHUNK
+    for i in range(0, len(text), chunk_size):
+        part = text[i : i + chunk_size]
+        if use_rich:
+            try:
+                api(
+                    token,
+                    "sendRichMessage",
+                    chat_id=chat_id,
+                    rich_message={"markdown": part},
+                )
+                continue
+            except urllib.error.HTTPError as e:
+                print("sendRichMessage failed: %s" % e.read().decode(), file=sys.stderr)
+        for j in range(0, len(part), PLAIN_CHUNK):
+            api(token, "sendMessage", chat_id=chat_id, text=part[j : j + PLAIN_CHUNK])
 
 
 def send_photo(token, chat_id, photo_path: str, caption: Optional[str] = None) -> None:
@@ -390,7 +399,7 @@ def run_agent_streaming(
     Returns session_id for persistence.
     """
     if not prompt.strip():
-        send_message(token, chat_id, "(no prompt)")
+        send_message(token, chat_id, "(no prompt)", use_rich=False)
         return resume_session
     cmd = [
         "cursor", "agent", "--print", "--trust", "--force",
@@ -477,7 +486,7 @@ def run_agent_streaming(
                 if err:
                     full_stderr_lines.append(err)
         except Exception as e:
-            send_message(token, chat_id, "Error running agent: %s" % e)
+            send_message(token, chat_id, "Error running agent: %s" % e, use_rich=False)
         finally:
             process_done.set()
 
@@ -494,7 +503,7 @@ def run_agent_streaming(
             p = proc_ref[0]
             if p and p.poll() is None:
                 p.kill()
-            send_message(token, chat_id, "Agent timed out after %s seconds." % timeout_sec)
+            send_message(token, chat_id, "Agent timed out after %s seconds." % timeout_sec, use_rich=False)
             timed_out = True
             break
         if now - last_typing >= TYPING_INTERVAL:
