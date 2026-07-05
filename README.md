@@ -67,8 +67,12 @@ Leave it running. When you send a text message to your bot on Telegram, it will 
 
 - `/new` — start a fresh Cursor agent session
 - `/new <prompt>` — new session, then run `<prompt>`
+- `/resume <session-id>` — switch back to a previous session (full UUID from `/status` or bot logs)
 - `/summarize` — summarize the current conversation (ask mode; read-only, does not edit files)
-- `/status` — show the current session id
+- `/status` — show the full current session id
+- `/model` — current model + latest top-tier pick per provider (auto-detected)
+- `/model all` — full list (~150 models)
+- `/model <slug>` — set model (e.g. `auto`, `gpt-5.2`)
 - `/help` — list these commands
 
 ---

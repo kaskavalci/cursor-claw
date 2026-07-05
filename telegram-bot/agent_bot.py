@@ -26,12 +26,14 @@ TYPING_INTERVAL = 4  # Telegram typing indicator lasts ~5s; re-send before it ex
 RICH_CHUNK = 32768  # sendRichMessage limit
 PLAIN_CHUNK = 4096  # sendMessage limit
 DEFAULT_AGENT_TIMEOUT = 0  # 0 = unlimited; set CURSOR_AGENT_TIMEOUT in config or env to limit
+DEFAULT_AGENT_MODEL = "Auto"
 
 BASE = "https://api.telegram.org/bot"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(SCRIPT_DIR)
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "config")
 SESSION_FILE = os.path.join(SCRIPT_DIR, ".cursor_agent_session")
+MODEL_FILE = os.path.join(SCRIPT_DIR, ".cursor_agent_model")
 CHAT_ID_FILE = os.path.join(SCRIPT_DIR, "chat_id")
 OFFSET_FILE = os.path.join(SCRIPT_DIR, ".telegram_offset")
 RECEIVED_IMAGES_DIR = os.path.join(SCRIPT_DIR, "received_images")
@@ -283,6 +285,18 @@ def save_session(session_id: Optional[str]) -> None:
             print("Could not save session: %s" % e, file=sys.stderr)
 
 
+def load_model() -> str:
+    if os.path.isfile(MODEL_FILE):
+        try:
+            with open(MODEL_FILE) as f:
+                model = f.read().strip()
+                if model:
+                    return model
+        except Exception:
+            pass
+    return DEFAULT_AGENT_MODEL
+
+
 def save_chat_id(chat_id: int) -> None:
     """Persist chat_id so run_reminders.py can send scheduled messages to the user."""
     try:
@@ -406,7 +420,7 @@ def run_agent_streaming(
     cmd = [
         "cursor", "agent", "--print", "--trust", "--force",
         "--workspace", REPO_ROOT,
-        "--model", "Auto",
+        "--model", load_model(),
         "--output-format", "stream-json",
     ]
     if agent_mode:
@@ -526,8 +540,10 @@ def run_agent_streaming(
 def register_bot_commands(token: str) -> None:
     commands = [
         {"command": "new", "description": "Start a new agent session"},
+        {"command": "resume", "description": "Resume a previous session by id"},
         {"command": "summarize", "description": "Summarize current conversation"},
         {"command": "status", "description": "Show session id"},
+        {"command": "model", "description": "Show or set agent model"},
         {"command": "help", "description": "List commands"},
     ]
     try:
@@ -628,6 +644,8 @@ def main():
                 chat_id=chat_id,
                 send_message=send_message,
                 session_file=SESSION_FILE,
+                model_file=MODEL_FILE,
+                default_model=DEFAULT_AGENT_MODEL,
                 repo_root=REPO_ROOT,
             )
             if result.session_id is not None:
