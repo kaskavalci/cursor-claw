@@ -5,6 +5,7 @@
 # Telegram bot: secrets and session state
 telegram-bot/config
 telegram-bot/.cursor_agent_session
+telegram-bot/.cursor_agent_model
 telegram-bot/chat_id
 telegram-bot/.telegram_offset
 telegram-bot/reminders.json
@@ -14,3 +15,6 @@ telegram-bot/logs/
 telegram-bot/pending_images/
 telegram-bot/pending_attachments/
 __pycache__/
+.worktrees/
+
+output.log

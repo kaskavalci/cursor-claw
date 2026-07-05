@@ -63,6 +63,18 @@ Leave it running. When you send a text message to your bot on Telegram, it will 
 
 **Hand off to systemd:** Once the bot is working, you can message the agent (e.g. "install the systemd unit with lingering so the bot runs at boot") and the agent can copy the unit files to `~/.config/systemd/user/`, run `loginctl enable-linger $USER`, and enable/start the service. After that, you can stop the script in your terminal (Ctrl+C); the bot will keep running under systemd and will start automatically at boot (and with lingering, even when you're not logged in).
 
+### Bot commands
+
+- `/new` — start a fresh Cursor agent session
+- `/new <prompt>` — new session, then run `<prompt>`
+- `/resume <session-id>` — switch back to a previous session (full UUID from `/status` or bot logs)
+- `/summarize` — summarize the current conversation (ask mode; read-only, does not edit files)
+- `/status` — show the full current session id
+- `/model` — current model + latest top-tier pick per provider (auto-detected)
+- `/model all` — full list (~150 models)
+- `/model <slug>` — set model (e.g. `auto`, `gpt-5.2`)
+- `/help` — list these commands
+
 ---
 
 ## Sending images and files to the user

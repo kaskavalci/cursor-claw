@@ -15,6 +15,7 @@ import os
 import sys
 import time
 import json
+import shutil
 import subprocess
 import threading
 import urllib.request
@@ -26,12 +27,14 @@ TYPING_INTERVAL = 4  # Telegram typing indicator lasts ~5s; re-send before it ex
 RICH_CHUNK = 32768  # sendRichMessage limit
 PLAIN_CHUNK = 4096  # sendMessage limit
 DEFAULT_AGENT_TIMEOUT = 0  # 0 = unlimited; set CURSOR_AGENT_TIMEOUT in config or env to limit
+DEFAULT_AGENT_MODEL = "Auto"
 
 BASE = "https://api.telegram.org/bot"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(SCRIPT_DIR)
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "config")
 SESSION_FILE = os.path.join(SCRIPT_DIR, ".cursor_agent_session")
+MODEL_FILE = os.path.join(SCRIPT_DIR, ".cursor_agent_model")
 CHAT_ID_FILE = os.path.join(SCRIPT_DIR, "chat_id")
 OFFSET_FILE = os.path.join(SCRIPT_DIR, ".telegram_offset")
 RECEIVED_IMAGES_DIR = os.path.join(SCRIPT_DIR, "received_images")
@@ -283,6 +286,18 @@ def save_session(session_id: Optional[str]) -> None:
             print("Could not save session: %s" % e, file=sys.stderr)
 
 
+def load_model() -> str:
+    if os.path.isfile(MODEL_FILE):
+        try:
+            with open(MODEL_FILE) as f:
+                model = f.read().strip()
+                if model:
+                    return model
+        except Exception:
+            pass
+    return DEFAULT_AGENT_MODEL
+
+
 def save_chat_id(chat_id: int) -> None:
     """Persist chat_id so run_reminders.py can send scheduled messages to the user."""
     try:
@@ -390,9 +405,11 @@ def run_agent_streaming(
     resume_session: Optional[str],
     token: str,
     chat_id: int,
+    *,
+    agent_mode: Optional[str] = None,
 ) -> Optional[str]:
     """
-    Run cursor agent with stream-json: ignore "thinking" and "result". Send
+    Run agent with stream-json: ignore "thinking" and "result". Send
     every assistant message as a Telegram message (no --stream-partial-output,
     so each message is a full turn). Skip whitespace-only. Typing indicator
     until process done. Raw JSON stream written to telegram-bot/logs/<timestamp>.log.
@@ -401,12 +418,15 @@ def run_agent_streaming(
     if not prompt.strip():
         send_message(token, chat_id, "(no prompt)", use_rich=False)
         return resume_session
+    agent_bin = shutil.which("agent") or "agent"
     cmd = [
-        "cursor", "agent", "--print", "--trust", "--force",
+        agent_bin, "--print", "--trust", "--force",
         "--workspace", REPO_ROOT,
-        "--model", "Auto",
+        "--model", load_model(),
         "--output-format", "stream-json",
     ]
+    if agent_mode:
+        cmd.extend(["--mode", agent_mode])
     if resume_session:
         cmd.extend(["--resume", resume_session])
     cmd.append(prompt)
@@ -519,8 +539,24 @@ def run_agent_streaming(
     return session_id
 
 
+def register_bot_commands(token: str) -> None:
+    commands = [
+        {"command": "new", "description": "Start a new agent session"},
+        {"command": "resume", "description": "Resume a previous session by id"},
+        {"command": "summarize", "description": "Summarize current conversation"},
+        {"command": "status", "description": "Show session id"},
+        {"command": "model", "description": "Show or set agent model"},
+        {"command": "help", "description": "List commands"},
+    ]
+    try:
+        api(token, "setMyCommands", commands=commands)
+    except Exception as e:
+        print("setMyCommands failed: %s" % e, file=sys.stderr)
+
+
 def main():
     token, allowed_user_id = load_config()
+    register_bot_commands(token)
     offset = load_offset()
     if offset:
         print("Resuming from update offset %s." % offset, file=sys.stderr)
@@ -595,8 +631,39 @@ def main():
         if chat_id is None:
             continue
         save_chat_id(chat_id)
-        # Concatenate all new messages into one prompt (e.g. 3 messages -> one agent run)
-        text = "\n\n".join(batch_texts) if batch_texts else ""
+
+        from commands import handle_commands, parse_telegram_command
+
+        # If every text line is a command, handle via command path only
+        command_texts = [t for t in batch_texts if parse_telegram_command(t)]
+        non_command_texts = [t for t in batch_texts if not parse_telegram_command(t)]
+
+        if command_texts:
+            result = handle_commands(
+                command_texts,
+                session_id=session_id,
+                token=token,
+                chat_id=chat_id,
+                send_message=send_message,
+                session_file=SESSION_FILE,
+                model_file=MODEL_FILE,
+                default_model=DEFAULT_AGENT_MODEL,
+                repo_root=REPO_ROOT,
+            )
+            if result.session_id is not None:
+                session_id = result.session_id
+                save_session(session_id)
+            agent_prompt = result.agent_prompt
+            if non_command_texts:
+                extra = "\n\n".join(non_command_texts)
+                agent_prompt = f"{agent_prompt}\n\n{extra}" if agent_prompt else extra
+            elif not agent_prompt and not batch_image_paths and not batch_document_paths:
+                continue
+            text = agent_prompt or ""
+        else:
+            text = "\n\n".join(batch_texts) if batch_texts else ""
+
+        # Append attachment hints (unchanged)
         if batch_image_paths:
             text += "\n\n[User sent %d image(s). They are in the workspace at: %s. Look at them and respond accordingly.]" % (
                 len(batch_image_paths),
@@ -607,14 +674,24 @@ def main():
                 len(batch_document_paths),
                 ", ".join(batch_document_paths),
             )
+
         if not text.strip():
             continue
-        if len(batch_texts) > 1:
+
+        summarize_mode = "ask" if command_texts and any(
+            parse_telegram_command(t) and parse_telegram_command(t)[0] == "summarize" for t in command_texts
+        ) else None
+
+        if command_texts:
+            print("Running agent after command(s): %s..." % ", ".join(command_texts[:3]), file=sys.stderr)
+        elif len(batch_texts) > 1:
             print("Running agent for %d messages as one prompt (%s...)..." % (len(batch_texts), text[:50]), file=sys.stderr)
         else:
             print("Running agent for prompt: %s..." % text[:60], file=sys.stderr)
         send_chat_action(token, chat_id, "typing")
-        session_id = run_agent_streaming(text, session_id, token, chat_id)
+        session_id = run_agent_streaming(
+            text, session_id, token, chat_id, agent_mode=summarize_mode
+        )
         save_session(session_id)
 
 
