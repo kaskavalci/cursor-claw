@@ -16,3 +16,5 @@ telegram-bot/pending_images/
 telegram-bot/pending_attachments/
 __pycache__/
 .worktrees/
+
+output.log

@@ -159,6 +159,23 @@ class TestHandleCommands(unittest.TestCase):
                 self.assertEqual(f.read(), "gpt-5.2")
         self.assertIn("gpt-5.2", send.call_args[0][2])
 
+
+    def test_unknown_command_replies_help(self):
+        send = MagicMock()
+        result = handle_commands(["/foo"], session_id="abc", token="t", chat_id=1, send_message=send)
+        self.assertTrue(result.handled)
+        self.assertIsNone(result.agent_prompt)
+        send.assert_called_once()
+        self.assertIn("/help", send.call_args[0][2])
+
+    def test_summarize_sets_agent_prompt_when_session_exists(self):
+        from commands import SUMMARIZE_PROMPT
+
+        send = MagicMock()
+        sid = "82158677-e29c-4718-b123-456789abcdef"
+        result = handle_commands(["/summarize"], session_id=sid, token="t", chat_id=1, send_message=send)
+        self.assertTrue(result.handled)
+        self.assertEqual(result.agent_prompt, SUMMARIZE_PROMPT)
     def test_summarize_requires_session(self):
         send = MagicMock()
         result = handle_commands(["/summarize"], session_id=None, token="t", chat_id=1, send_message=send)

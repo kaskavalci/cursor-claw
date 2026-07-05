@@ -15,6 +15,7 @@ import os
 import sys
 import time
 import json
+import shutil
 import subprocess
 import threading
 import urllib.request
@@ -408,7 +409,7 @@ def run_agent_streaming(
     agent_mode: Optional[str] = None,
 ) -> Optional[str]:
     """
-    Run cursor agent with stream-json: ignore "thinking" and "result". Send
+    Run agent with stream-json: ignore "thinking" and "result". Send
     every assistant message as a Telegram message (no --stream-partial-output,
     so each message is a full turn). Skip whitespace-only. Typing indicator
     until process done. Raw JSON stream written to telegram-bot/logs/<timestamp>.log.
@@ -417,8 +418,9 @@ def run_agent_streaming(
     if not prompt.strip():
         send_message(token, chat_id, "(no prompt)", use_rich=False)
         return resume_session
+    agent_bin = shutil.which("agent") or "agent"
     cmd = [
-        "cursor", "agent", "--print", "--trust", "--force",
+        agent_bin, "--print", "--trust", "--force",
         "--workspace", REPO_ROOT,
         "--model", load_model(),
         "--output-format", "stream-json",
