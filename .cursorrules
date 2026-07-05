@@ -1,6 +1,6 @@
 # Cursor-Claw: workspace with Telegram–Cursor agent integration
 
-This workspace can use the Telegram bot in `telegram-bot/` to chat with the Cursor agent from Telegram. When the user asks to be reminded at a time: add to `telegram-bot/reminders.json` with `"at": "YYYY-MM-DDTHH:MM:SS"` (local time). Use `"text": "…"` for a fixed message, or `"prompt": "…"` to run the agent at that time and send its reply on Telegram. Append to the list; create file with `{"reminders": []}` if missing.
+This workspace can use the Telegram bot in `telegram-bot/` to chat with the Cursor agent from Telegram via **cursor-sdk** (`uv sync` at repo root; `CURSOR_API_KEY` in `telegram-bot/config`). When the user asks to be reminded at a time: add to `telegram-bot/reminders.json` with `"at": "YYYY-MM-DDTHH:MM:SS"` (local time). Use `"text": "…"` for a fixed message, or `"prompt": "…"` to run the agent at that time and send its reply on Telegram. Append to the list; create file with `{"reminders": []}` if missing.
 
 ## Keep context and rules up to date
 

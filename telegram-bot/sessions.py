@@ -17,6 +17,44 @@ CHATS_MAX_CHARS = 3500
 
 _ATTACHMENT_HINT_RE = re.compile(r"\[User sent \d+ .*\]", re.DOTALL)
 _SUMMARIZE_TITLE_PREFIX = "Summarize our conversation"
+_LEGACY_CLI_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+_SDK_SESSION_ID_RE = re.compile(r"^(agent|bc)-[0-9a-f-]+$", re.IGNORECASE)
+
+
+def is_legacy_cli_id(session_id: str) -> bool:
+    """True for pre-SDK CLI create-chat UUIDs (not resumable via cursor-sdk)."""
+    if not session_id:
+        return False
+    if _SDK_SESSION_ID_RE.match(session_id):
+        return False
+    return bool(_LEGACY_CLI_UUID_RE.match(session_id))
+
+
+def is_sdk_session_id(session_id: str) -> bool:
+    return bool(_SDK_SESSION_ID_RE.match(session_id or ""))
+
+
+def _filter_legacy_sessions(registry: SessionRegistry) -> bool:
+    """Remove legacy CLI sessions. Returns True if registry changed."""
+    before_count = len(registry.sessions)
+    prev_active = registry.active_id
+    registry.sessions = [s for s in registry.sessions if not is_legacy_cli_id(s.id)]
+    if registry.active_id and is_legacy_cli_id(registry.active_id):
+        registry.active_id = registry.sessions[-1].id if registry.sessions else None
+        print(
+            "Dropped legacy CLI session from registry; send /new to start an SDK session.",
+            file=sys.stderr,
+        )
+    if len(registry.sessions) < before_count:
+        print(
+            "Removed %d legacy CLI session(s) from registry."
+            % (before_count - len(registry.sessions)),
+            file=sys.stderr,
+        )
+    return len(registry.sessions) != before_count or registry.active_id != prev_active
 
 
 @dataclass
@@ -111,7 +149,11 @@ def load_registry(
         try:
             with open(sessions_file) as f:
                 data = json.load(f)
-            return SessionRegistry.from_dict(data)
+            registry = SessionRegistry.from_dict(data)
+            changed = _filter_legacy_sessions(registry)
+            if changed:
+                save_registry(sessions_file, registry)
+            return registry
         except json.JSONDecodeError as e:
             print(
                 "Corrupt session registry %s: %s" % (sessions_file, e),
@@ -139,7 +181,7 @@ def load_registry(
         try:
             with open(session_file) as f:
                 sid = f.read().strip()
-            if sid:
+            if sid and not is_legacy_cli_id(sid):
                 now = _now_iso()
                 registry.sessions.append(
                     SessionEntry(
@@ -152,6 +194,12 @@ def load_registry(
                 )
                 registry.active_id = sid
                 save_registry(sessions_file, registry)
+            elif sid and is_legacy_cli_id(sid):
+                print(
+                    "Legacy CLI session in %s ignored; send /new after SDK migration."
+                    % session_file,
+                    file=sys.stderr,
+                )
         except OSError:
             pass
     return registry
@@ -210,6 +258,20 @@ def register(
         )
         _prune(registry)
     registry.active_id = session_id
+    save_registry(sessions_file, registry)
+
+
+def drop_session(
+    sessions_file: str,
+    session_id: str,
+    *,
+    session_file: str = "",
+) -> None:
+    """Remove a stale session from the registry and fix active_id."""
+    registry = load_registry(sessions_file, session_file=session_file)
+    registry.sessions = [s for s in registry.sessions if s.id != session_id]
+    if registry.active_id == session_id:
+        registry.active_id = registry.sessions[-1].id if registry.sessions else None
     save_registry(sessions_file, registry)
 
 

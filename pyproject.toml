@@ -1,0 +1,8 @@
+[project]
+name = "cursor-claw"
+version = "0.1.0"
+description = "Telegram bot integration for Cursor agent"
+requires-python = ">=3.11"
+dependencies = [
+    "cursor-sdk",
+]

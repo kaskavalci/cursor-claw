@@ -5,21 +5,25 @@ import unittest
 
 import sessions
 
+TEST_SID = "agent-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+TEST_SID_B = "agent-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+TEST_SID_A = "agent-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+
 
 class TestSessionRegistry(unittest.TestCase):
     def test_register_creates_entry_with_title(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "sessions.json")
-            sessions.register(path, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", title="Hello world")
+            sessions.register(path, TEST_SID, title="Hello world")
             reg = sessions.load_registry(path)
-            self.assertEqual(reg.active_id, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+            self.assertEqual(reg.active_id, TEST_SID)
             self.assertEqual(len(reg.sessions), 1)
             self.assertEqual(reg.sessions[0].title, "Hello world")
 
     def test_record_exchange_sets_title_once_and_updates_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "sessions.json")
-            sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+            sid = TEST_SID
             sessions.register(path, sid, title="New chat")
             sessions.record_exchange(
                 path, sid, user_text="Fix the bug", assistant_text="I will fix it."
@@ -39,17 +43,17 @@ class TestSessionRegistry(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "sessions.json")
             reg = sessions.SessionRegistry(
-                active_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                active_id=TEST_SID_B,
                 sessions=[
                     sessions.SessionEntry(
-                        id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                        id=TEST_SID_A,
                         created_at="2026-07-05T10:00:00",
                         last_active_at="2026-07-05T10:00:00",
                         title="Older chat",
                         summary="Old summary",
                     ),
                     sessions.SessionEntry(
-                        id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                        id=TEST_SID_B,
                         created_at="2026-07-05T11:00:00",
                         last_active_at="2026-07-05T11:30:00",
                         title="Newer chat",
@@ -72,21 +76,21 @@ class TestSessionRegistry(unittest.TestCase):
             for i in range(sessions.MAX_SESSIONS + 5):
                 reg.sessions.append(
                     sessions.SessionEntry(
-                        id=f"{i:08x}-0000-0000-0000-000000000000",
+                        id=f"agent-{i:08d}-0000-0000-0000-000000000000",
                         created_at=f"2026-01-{min(i + 1, 28):02d}T00:00:00",
                         last_active_at=f"2026-01-{min(i + 1, 28):02d}T00:00:00",
                         title=f"Chat {i}",
                     )
                 )
             sessions.save_registry(path, reg)
-            sessions.register(path, "ffffffff-ffff-ffff-ffff-ffffffffffff", title="Latest")
+            sessions.register(path, "agent-ffffffff-ffff-ffff-ffff-ffffffffffff", title="Latest")
             reg = sessions.load_registry(path)
             self.assertEqual(len(reg.sessions), sessions.MAX_SESSIONS)
             ids = {s.id for s in reg.sessions}
-            self.assertIn("ffffffff-ffff-ffff-ffff-ffffffffffff", ids)
-            self.assertNotIn("00000000-0000-0000-0000-000000000000", ids)
+            self.assertIn("agent-ffffffff-ffff-ffff-ffff-ffffffffffff", ids)
+            self.assertNotIn("agent-00000000-0000-0000-0000-000000000000", ids)
 
-    def test_legacy_migration_from_session_file(self):
+    def test_legacy_migration_skips_cli_uuid(self):
         with tempfile.TemporaryDirectory() as tmp:
             sessions_path = os.path.join(tmp, "sessions.json")
             session_path = os.path.join(tmp, ".cursor_agent_session")
@@ -94,10 +98,35 @@ class TestSessionRegistry(unittest.TestCase):
             with open(session_path, "w") as f:
                 f.write(sid)
             reg = sessions.load_registry(sessions_path, session_file=session_path)
-            self.assertEqual(reg.active_id, sid)
-            self.assertEqual(len(reg.sessions), 1)
-            self.assertEqual(reg.sessions[0].title, "Imported session")
-            self.assertTrue(os.path.isfile(sessions_path))
+            self.assertIsNone(reg.active_id)
+            self.assertEqual(len(reg.sessions), 0)
+            self.assertFalse(os.path.isfile(sessions_path))
+
+    def test_load_registry_filters_legacy_cli_sessions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "sessions.json")
+            reg = sessions.SessionRegistry(
+                active_id="82158677-e29c-4718-b123-456789abcdef",
+                sessions=[
+                    sessions.SessionEntry(
+                        id="82158677-e29c-4718-b123-456789abcdef",
+                        created_at="2026-07-05T10:00:00",
+                        last_active_at="2026-07-05T10:00:00",
+                        title="Old CLI chat",
+                    ),
+                    sessions.SessionEntry(
+                        id="agent-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                        created_at="2026-07-05T11:00:00",
+                        last_active_at="2026-07-05T11:00:00",
+                        title="SDK chat",
+                    ),
+                ],
+            )
+            sessions.save_registry(path, reg)
+            loaded = sessions.load_registry(path)
+            self.assertEqual(len(loaded.sessions), 1)
+            self.assertEqual(loaded.sessions[0].id, "agent-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+            self.assertEqual(loaded.active_id, "agent-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
 
     def test_resolve_by_index(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -105,13 +134,13 @@ class TestSessionRegistry(unittest.TestCase):
             reg = sessions.SessionRegistry(
                 sessions=[
                     sessions.SessionEntry(
-                        id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                        id=TEST_SID_A,
                         created_at="2026-07-05T10:00:00",
                         last_active_at="2026-07-05T11:00:00",
                         title="Recent",
                     ),
                     sessions.SessionEntry(
-                        id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                        id=TEST_SID_B,
                         created_at="2026-07-05T09:00:00",
                         last_active_at="2026-07-05T10:00:00",
                         title="Older",
@@ -136,7 +165,7 @@ class TestSessionRegistry(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "sessions.json")
-            sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+            sid = TEST_SID
             sessions.register(path, sid, title="Fix the bug")
             sessions.record_exchange(
                 path, sid, user_text=SUMMARIZE_PROMPT, assistant_text="Summary bullets."

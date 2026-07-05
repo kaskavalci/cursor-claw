@@ -1,44 +1,38 @@
 #!/usr/bin/env python3
 """
 Telegram bot: only accepts messages from the allowed user (see config); forwards
-them to Cursor agent and sends the agent's response back. Accepts photos and file
-attachments (e.g. PDF); files are saved under telegram-bot/received_documents/.
-Uses --output-format stream-json and --resume for multi-session conversations
-(session registry in .cursor_agent_sessions.json; active session pointer in
-.cursor_agent_session). All other users are dropped.
+them to Cursor agent via cursor-sdk and sends the agent's response back. Accepts
+photos and file attachments (e.g. PDF); files are saved under telegram-bot/received_documents/.
+Uses in-process SDK Agent handles with session registry in .cursor_agent_sessions.json;
+active session pointer in .cursor_agent_session. All other users are dropped.
 
-Config: create telegram-bot/config from config.example with TELEGRAM_BOT_TOKEN and
-TELEGRAM_ALLOWED_USER_ID. Run from a terminal outside Cursor.
+Config: create telegram-bot/config from config.example with TELEGRAM_BOT_TOKEN,
+TELEGRAM_ALLOWED_USER_ID, and CURSOR_API_KEY. Run from a terminal outside Cursor.
 """
 
 import os
 import sys
 import time
 import json
-import shutil
-import subprocess
-import threading
 import urllib.request
 import urllib.error
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Optional, Tuple
+from typing import Optional
 
+import config_loader
 import sessions
+from agent_pool import AgentPool
+from agent_runner import run_agent_streaming
 
-TYPING_INTERVAL = 4  # Telegram typing indicator lasts ~5s; re-send before it expires
 RICH_CHUNK = 32768  # sendRichMessage limit
 PLAIN_CHUNK = 4096  # sendMessage limit
-DEFAULT_AGENT_TIMEOUT = 0  # 0 = unlimited; set CURSOR_AGENT_TIMEOUT in config or env to limit
-DEFAULT_AGENT_MODEL = "Auto"
+DEFAULT_AGENT_MODEL = config_loader.DEFAULT_AGENT_MODEL
 
 BASE = "https://api.telegram.org/bot"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(SCRIPT_DIR)
-CONFIG_FILE = os.path.join(SCRIPT_DIR, "config")
 SESSION_FILE = os.path.join(SCRIPT_DIR, ".cursor_agent_session")
 SESSIONS_FILE = os.path.join(SCRIPT_DIR, ".cursor_agent_sessions.json")
-MODEL_FILE = os.path.join(SCRIPT_DIR, ".cursor_agent_model")
+MODEL_FILE = config_loader.MODEL_FILE
 CHAT_ID_FILE = os.path.join(SCRIPT_DIR, "chat_id")
 OFFSET_FILE = os.path.join(SCRIPT_DIR, ".telegram_offset")
 RECEIVED_IMAGES_DIR = os.path.join(SCRIPT_DIR, "received_images")
@@ -48,67 +42,12 @@ PENDING_IMAGES_DIR = os.path.join(SCRIPT_DIR, "pending_images")
 PENDING_ATTACHMENTS_DIR = os.path.join(SCRIPT_DIR, "pending_attachments")
 
 
-def get_agent_timeout() -> int:
-    """Agent subprocess timeout in seconds. Config file or env CURSOR_AGENT_TIMEOUT, else default."""
-    timeout = None
-    if os.path.isfile(CONFIG_FILE):
-        with open(CONFIG_FILE) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if "=" in line:
-                    k, v = line.split("=", 1)
-                    k, v = k.strip(), v.strip().strip("'\"")
-                    if k == "CURSOR_AGENT_TIMEOUT" and v:
-                        try:
-                            timeout = int(v)
-                        except ValueError:
-                            pass
-                        break
-    if timeout is None:
-        try:
-            timeout = int(os.environ.get("CURSOR_AGENT_TIMEOUT", str(DEFAULT_AGENT_TIMEOUT)))
-        except ValueError:
-            timeout = DEFAULT_AGENT_TIMEOUT
-    return timeout if timeout > 0 else 0  # 0 = unlimited
+def load_config():
+    return config_loader.load_bot_config()
 
 
-def load_config() -> Tuple[str, int]:
-    """Load TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_USER_ID from config file or env."""
-    token = None
-    user_id = None
-    if os.path.isfile(CONFIG_FILE):
-        with open(CONFIG_FILE) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if "=" in line:
-                    k, v = line.split("=", 1)
-                    k, v = k.strip(), v.strip().strip("'\"")
-                    if k == "TELEGRAM_BOT_TOKEN" and v:
-                        token = v
-                    elif k == "TELEGRAM_ALLOWED_USER_ID" and v:
-                        try:
-                            user_id = int(v)
-                        except ValueError:
-                            pass
-    token = token or os.environ.get("TELEGRAM_BOT_TOKEN")
-    if not token:
-        print("Set TELEGRAM_BOT_TOKEN in %s or env." % CONFIG_FILE, file=sys.stderr)
-        sys.exit(1)
-    if user_id is None:
-        uid_env = os.environ.get("TELEGRAM_ALLOWED_USER_ID")
-        if uid_env:
-            try:
-                user_id = int(uid_env)
-            except ValueError:
-                pass
-        if user_id is None:
-            print("Set TELEGRAM_ALLOWED_USER_ID in %s or env." % CONFIG_FILE, file=sys.stderr)
-            sys.exit(1)
-    return token, user_id
+def load_model() -> str:
+    return config_loader.load_model(MODEL_FILE)
 
 
 def api(token, method, **params):
@@ -136,7 +75,7 @@ def collapse_blank_lines(text: str) -> str:
     result = []
     in_blank_run = False
     for line in lines:
-        if not line.strip():  # blank: empty or whitespace-only
+        if not line.strip():
             if not in_blank_run:
                 result.append("")
                 in_blank_run = True
@@ -275,31 +214,24 @@ def load_session() -> Optional[str]:
     if os.path.isfile(SESSION_FILE):
         try:
             with open(SESSION_FILE) as f:
-                return f.read().strip() or None
+                sid = f.read().strip() or None
+            if sid and sessions.is_legacy_cli_id(sid):
+                return None
+            return sid
         except Exception:
             pass
     return None
 
 
 def save_session(session_id: Optional[str]) -> None:
-    if session_id:
-        try:
+    try:
+        if session_id:
             with open(SESSION_FILE, "w") as f:
                 f.write(session_id)
-        except Exception as e:
-            print("Could not save session: %s" % e, file=sys.stderr)
-
-
-def load_model() -> str:
-    if os.path.isfile(MODEL_FILE):
-        try:
-            with open(MODEL_FILE) as f:
-                model = f.read().strip()
-                if model:
-                    return model
-        except Exception:
-            pass
-    return DEFAULT_AGENT_MODEL
+        elif os.path.isfile(SESSION_FILE):
+            os.remove(SESSION_FILE)
+    except Exception as e:
+        print("Could not save session: %s" % e, file=sys.stderr)
 
 
 def save_chat_id(chat_id: int) -> None:
@@ -368,193 +300,6 @@ def save_offset(offset: int) -> None:
         print("Could not save offset: %s" % e, file=sys.stderr)
 
 
-@dataclass
-class AgentRunResult:
-    session_id: Optional[str]
-    assistant_text: str
-
-
-def _parse_session_and_final_output(full_stdout: str, full_stderr: str, returncode: int) -> Tuple[str, Optional[str]]:
-    """Parse full stdout for session_id and final displayable result. Returns (response_text, session_id)."""
-    session_id = None
-    response_text = None
-    for line in full_stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        sid = obj.get("session_id") or obj.get("sessionId") or obj.get("chatId")
-        if sid:
-            session_id = str(sid)
-        if "result" in obj and isinstance(obj["result"], str):
-            response_text = obj["result"].strip()
-        elif response_text is None:
-            for key in ("text", "content", "response", "message", "output"):
-                if key in obj and isinstance(obj[key], str):
-                    response_text = obj[key]
-                    break
-    if response_text is None and full_stdout:
-        try:
-            obj = json.loads(full_stdout.strip().split("\n")[-1] or "{}")
-            session_id = session_id or obj.get("session_id") or obj.get("sessionId")
-            response_text = obj.get("result") or obj.get("text") or obj.get("content") or full_stdout
-            if isinstance(response_text, dict):
-                response_text = response_text.get("content", str(response_text))
-        except (json.JSONDecodeError, IndexError):
-            response_text = full_stdout
-    if returncode != 0 and not response_text:
-        response_text = full_stderr or "Agent exited with code %s" % returncode
-    return response_text or "(no output)", session_id
-
-
-def run_agent_streaming(
-    prompt: str,
-    resume_session: Optional[str],
-    token: str,
-    chat_id: int,
-    *,
-    agent_mode: Optional[str] = None,
-) -> AgentRunResult:
-    """
-    Run agent with stream-json: ignore "thinking" and "result". Send
-    every assistant message as a Telegram message (no --stream-partial-output,
-    so each message is a full turn). Skip whitespace-only. Typing indicator
-    until process done. Raw JSON stream written to telegram-bot/logs/<timestamp>.log.
-    Returns session_id and last assistant text for registry updates.
-    """
-    if not prompt.strip():
-        send_message(token, chat_id, "(no prompt)", use_rich=False)
-        return AgentRunResult(session_id=resume_session, assistant_text="")
-    agent_bin = shutil.which("agent") or "agent"
-    cmd = [
-        agent_bin, "--print", "--trust", "--force",
-        "--workspace", REPO_ROOT,
-        "--model", load_model(),
-        "--output-format", "stream-json",
-    ]
-    if agent_mode:
-        cmd.extend(["--mode", agent_mode])
-    if resume_session:
-        cmd.extend(["--resume", resume_session])
-    cmd.append(prompt)
-    timeout_sec = get_agent_timeout()
-    full_stdout_lines = []
-    full_stderr_lines = []
-    last_assistant_ref: list[str] = [""]
-    lock = threading.Lock()
-    process_done = threading.Event()
-    proc_ref = [None]  # so main thread can kill on timeout
-
-    os.makedirs(LOGS_DIR, exist_ok=True)
-    log_name = datetime.now().strftime("%Y-%m-%dT%H-%M-%S") + ".log"
-    log_path = os.path.join(LOGS_DIR, log_name)
-
-    def reader():
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                cwd=REPO_ROOT,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-            )
-            proc_ref[0] = proc
-            try:
-                with open(log_path, "w") as logf:
-                    for line in iter(proc.stdout.readline, ""):
-                        with lock:
-                            full_stdout_lines.append(line)
-                        logf.write(line)
-                        logf.flush()
-                        line_stripped = line.strip()
-                        if not line_stripped:
-                            continue
-                        try:
-                            obj = json.loads(line_stripped)
-                        except json.JSONDecodeError:
-                            continue
-                        msg_type = (obj.get("role") or obj.get("type") or obj.get("messageType") or "").lower()
-                        if msg_type == "thinking":
-                            continue
-                        if msg_type == "result":
-                            continue
-                        if msg_type != "assistant":
-                            continue
-                        # Stream-json: text in message.content[].text
-                        text = None
-                        msg = obj.get("message")
-                        if isinstance(msg, dict):
-                            content = msg.get("content")
-                            if isinstance(content, list):
-                                parts = []
-                                for item in content:
-                                    if isinstance(item, dict) and item.get("type") == "text" and "text" in item:
-                                        parts.append(item["text"])
-                                if parts:
-                                    text = "".join(parts)
-                        if text is None:
-                            text = (
-                                obj.get("content")
-                                or obj.get("text")
-                                or obj.get("delta")
-                                or obj.get("result")
-                                or obj.get("output")
-                            )
-                        if not isinstance(text, str):
-                            continue
-                        to_send = text.strip()
-                        if to_send:
-                            with lock:
-                                last_assistant_ref[0] = to_send
-                            send_pending_attachments(token, chat_id)
-                            send_pending_images(token, chat_id)
-                            send_message(token, chat_id, collapse_blank_lines(to_send))
-            finally:
-                proc.wait()
-                err = proc.stderr.read() if proc.stderr else ""
-                if err:
-                    full_stderr_lines.append(err)
-        except Exception as e:
-            send_message(token, chat_id, "Error running agent: %s" % e, use_rich=False)
-        finally:
-            process_done.set()
-
-    t = threading.Thread(target=reader, daemon=False)
-    t.start()
-    last_typing = 0.0
-    start_time = time.time()
-    timed_out = False
-
-    while not process_done.is_set():
-        time.sleep(1)
-        now = time.time()
-        if timeout_sec and (now - start_time) >= timeout_sec:
-            p = proc_ref[0]
-            if p and p.poll() is None:
-                p.kill()
-            send_message(token, chat_id, "Agent timed out after %s seconds." % timeout_sec, use_rich=False)
-            timed_out = True
-            break
-        if now - last_typing >= TYPING_INTERVAL:
-            send_chat_action(token, chat_id, "typing")
-            last_typing = now
-
-    t.join(timeout=10)
-    full_stdout = "".join(full_stdout_lines)
-    full_stderr = "".join(full_stderr_lines)
-    response_text, session_id = _parse_session_and_final_output(full_stdout, full_stderr, 0)
-    if not session_id:
-        session_id = resume_session
-    last_assistant_text = last_assistant_ref[0]
-    if not last_assistant_text and response_text and response_text != "(no output)":
-        last_assistant_text = response_text
-    return AgentRunResult(session_id=session_id, assistant_text=last_assistant_text)
-
-
 def register_bot_commands(token: str) -> None:
     commands = [
         {"command": "new", "description": "Start a new agent session"},
@@ -572,8 +317,11 @@ def register_bot_commands(token: str) -> None:
 
 
 def main():
+    config_loader.ensure_cursor_api_key()
     token, allowed_user_id = load_config()
     register_bot_commands(token)
+    model = load_model()
+    pool = AgentPool(REPO_ROOT, model)
     offset = load_offset()
     if offset:
         print("Resuming from update offset %s." % offset, file=sys.stderr)
@@ -581,153 +329,170 @@ def main():
     registry = sessions.load_registry(SESSIONS_FILE, session_file=SESSION_FILE)
     if session_id and registry.active_id != session_id:
         sessions.set_active(SESSIONS_FILE, session_id, session_file=SESSION_FILE)
+    if session_id and sessions.is_legacy_cli_id(session_id):
+        session_id = None
+        save_session(None)
     if session_id:
-        print("Resuming session: %s..." % session_id[:20], file=sys.stderr)
-    print("Agent bot running. Only user_id=%s accepted; others dropped." % allowed_user_id, file=sys.stderr)
+        if not pool.warm(session_id):
+            sessions.drop_session(SESSIONS_FILE, session_id, session_file=SESSION_FILE)
+            session_id = None
+            save_session(None)
+    print("Agent bot running (cursor-sdk). Only user_id=%s accepted." % allowed_user_id, file=sys.stderr)
     print("Ctrl+C to stop.", file=sys.stderr)
-    while True:
-        try:
-            out = api(token, "getUpdates", offset=offset, timeout=30)
-        except urllib.error.URLError as e:
-            print("API error: %s" % e, file=sys.stderr)
-            time.sleep(5)
-            continue
-        if not out.get("ok"):
-            print("API not ok: %s" % out, file=sys.stderr)
-            time.sleep(5)
-            continue
-        updates = out.get("result", [])
-        if not updates:
-            continue
-        # Collect all new messages from allowed user (batch: e.g. 3 messages sent while idle)
-        batch_texts = []
-        batch_image_paths = []  # workspace-relative paths for agent
-        batch_document_paths = []  # workspace-relative paths for agent (PDF etc.)
-        chat_id = None
-        for i, upd in enumerate(updates):
-            msg = upd.get("message") or upd.get("edited_message")
-            if not msg:
+    try:
+        while True:
+            try:
+                out = api(token, "getUpdates", offset=offset, timeout=30)
+            except urllib.error.URLError as e:
+                print("API error: %s" % e, file=sys.stderr)
+                time.sleep(5)
                 continue
-            uid = (msg.get("from") or {}).get("id")
-            if uid != allowed_user_id:
+            if not out.get("ok"):
+                print("API not ok: %s" % out, file=sys.stderr)
+                time.sleep(5)
+                continue
+            updates = out.get("result", [])
+            if not updates:
+                continue
+            batch_texts = []
+            batch_image_paths = []
+            batch_document_paths = []
+            chat_id = None
+            for i, upd in enumerate(updates):
+                msg = upd.get("message") or upd.get("edited_message")
+                if not msg:
+                    continue
+                uid = (msg.get("from") or {}).get("id")
+                if uid != allowed_user_id:
+                    continue
+                if chat_id is None:
+                    chat_id = msg["chat"]["id"]
+                text = (msg.get("text") or "").strip()
+                if text:
+                    batch_texts.append(text)
+                photos = msg.get("photo") or []
+                if photos:
+                    file_id = photos[-1].get("file_id")
+                    if file_id:
+                        os.makedirs(RECEIVED_IMAGES_DIR, exist_ok=True)
+                        local_name = "photo_%s_%s.jpg" % (upd["update_id"], i)
+                        dest_path = os.path.join(RECEIVED_IMAGES_DIR, local_name)
+                        if download_telegram_photo(token, file_id, dest_path):
+                            batch_image_paths.append(os.path.join("telegram-bot", "received_images", local_name))
+                    caption = (msg.get("caption") or "").strip()
+                    if caption:
+                        batch_texts.append(caption)
+                doc = msg.get("document")
+                if isinstance(doc, dict) and doc.get("file_id"):
+                    os.makedirs(RECEIVED_DOCUMENTS_DIR, exist_ok=True)
+                    orig_name = doc.get("file_name") or "file"
+                    safe = _safe_document_filename(orig_name)
+                    local_name = "doc_%s_%s_%s" % (upd["update_id"], i, safe)
+                    dest_path = os.path.join(RECEIVED_DOCUMENTS_DIR, local_name)
+                    if download_telegram_file(token, doc["file_id"], dest_path):
+                        batch_document_paths.append(
+                            os.path.join("telegram-bot", "received_documents", local_name)
+                        )
+                    cap = (msg.get("caption") or "").strip()
+                    if cap:
+                        batch_texts.append(cap)
+            offset = updates[-1]["update_id"] + 1
+            save_offset(offset)
+            if not batch_texts and not batch_image_paths and not batch_document_paths:
                 continue
             if chat_id is None:
-                chat_id = msg["chat"]["id"]
-            text = (msg.get("text") or "").strip()
-            if text:
-                batch_texts.append(text)
-            # Photos: download largest size and pass path to agent so it can read the image
-            photos = msg.get("photo") or []
-            if photos:
-                file_id = photos[-1].get("file_id")  # largest size
-                if file_id:
-                    os.makedirs(RECEIVED_IMAGES_DIR, exist_ok=True)
-                    local_name = "photo_%s_%s.jpg" % (upd["update_id"], i)
-                    dest_path = os.path.join(RECEIVED_IMAGES_DIR, local_name)
-                    if download_telegram_photo(token, file_id, dest_path):
-                        batch_image_paths.append(os.path.join("telegram-bot", "received_images", local_name))
-                caption = (msg.get("caption") or "").strip()
-                if caption:
-                    batch_texts.append(caption)
-            doc = msg.get("document")
-            if isinstance(doc, dict) and doc.get("file_id"):
-                os.makedirs(RECEIVED_DOCUMENTS_DIR, exist_ok=True)
-                orig_name = doc.get("file_name") or "file"
-                safe = _safe_document_filename(orig_name)
-                local_name = "doc_%s_%s_%s" % (upd["update_id"], i, safe)
-                dest_path = os.path.join(RECEIVED_DOCUMENTS_DIR, local_name)
-                if download_telegram_file(token, doc["file_id"], dest_path):
-                    batch_document_paths.append(
-                        os.path.join("telegram-bot", "received_documents", local_name)
-                    )
-                cap = (msg.get("caption") or "").strip()
-                if cap:
-                    batch_texts.append(cap)
-        # Advance offset past entire batch so we don't re-process
-        offset = updates[-1]["update_id"] + 1
-        save_offset(offset)
-        if not batch_texts and not batch_image_paths and not batch_document_paths:
-            continue
-        if chat_id is None:
-            continue
-        save_chat_id(chat_id)
-
-        from commands import handle_commands, parse_telegram_command
-
-        # If every text line is a command, handle via command path only
-        command_texts = [t for t in batch_texts if parse_telegram_command(t)]
-        non_command_texts = [t for t in batch_texts if not parse_telegram_command(t)]
-
-        if command_texts:
-            result = handle_commands(
-                command_texts,
-                session_id=session_id,
-                token=token,
-                chat_id=chat_id,
-                send_message=send_message,
-                session_file=SESSION_FILE,
-                sessions_file=SESSIONS_FILE,
-                model_file=MODEL_FILE,
-                default_model=DEFAULT_AGENT_MODEL,
-                repo_root=REPO_ROOT,
-            )
-            if result.session_id is not None:
-                session_id = result.session_id
-                save_session(session_id)
-            agent_prompt = result.agent_prompt
-            if non_command_texts:
-                extra = "\n\n".join(non_command_texts)
-                agent_prompt = f"{agent_prompt}\n\n{extra}" if agent_prompt else extra
-            elif not agent_prompt and not batch_image_paths and not batch_document_paths:
                 continue
-            text = agent_prompt or ""
-        else:
-            text = "\n\n".join(batch_texts) if batch_texts else ""
+            save_chat_id(chat_id)
 
-        # Append attachment hints (unchanged)
-        if batch_image_paths:
-            text += "\n\n[User sent %d image(s). They are in the workspace at: %s. Look at them and respond accordingly.]" % (
-                len(batch_image_paths),
-                ", ".join(batch_image_paths),
+            from commands import handle_commands, parse_telegram_command
+
+            command_texts = [t for t in batch_texts if parse_telegram_command(t)]
+            non_command_texts = [t for t in batch_texts if not parse_telegram_command(t)]
+
+            if command_texts:
+                result = handle_commands(
+                    command_texts,
+                    session_id=session_id,
+                    token=token,
+                    chat_id=chat_id,
+                    send_message=send_message,
+                    session_file=SESSION_FILE,
+                    sessions_file=SESSIONS_FILE,
+                    model_file=MODEL_FILE,
+                    default_model=DEFAULT_AGENT_MODEL,
+                    repo_root=REPO_ROOT,
+                    agent_pool=pool,
+                )
+                if result.session_id is not None:
+                    session_id = result.session_id
+                    save_session(session_id)
+                agent_prompt = result.agent_prompt
+                if non_command_texts:
+                    extra = "\n\n".join(non_command_texts)
+                    agent_prompt = f"{agent_prompt}\n\n{extra}" if agent_prompt else extra
+                elif not agent_prompt and not batch_image_paths and not batch_document_paths:
+                    continue
+                text = agent_prompt or ""
+            else:
+                text = "\n\n".join(batch_texts) if batch_texts else ""
+
+            if batch_image_paths:
+                text += "\n\n[User sent %d image(s). They are in the workspace at: %s. Look at them and respond accordingly.]" % (
+                    len(batch_image_paths),
+                    ", ".join(batch_image_paths),
+                )
+            if batch_document_paths:
+                text += "\n\n[User sent %d file(s). They are in the workspace at: %s. Read the file(s) and respond accordingly.]" % (
+                    len(batch_document_paths),
+                    ", ".join(batch_document_paths),
+                )
+
+            if not text.strip():
+                continue
+
+            summarize_mode = "plan" if command_texts and any(
+                parse_telegram_command(t) and parse_telegram_command(t)[0] == "summarize" for t in command_texts
+            ) else None
+
+            if command_texts:
+                print("Running agent after command(s): %s..." % ", ".join(command_texts[:3]), file=sys.stderr)
+            elif len(batch_texts) > 1:
+                print("Running agent for %d messages as one prompt (%s...)..." % (len(batch_texts), text[:50]), file=sys.stderr)
+            else:
+                print("Running agent for prompt: %s..." % text[:60], file=sys.stderr)
+            send_chat_action(token, chat_id, "typing")
+            run_result = run_agent_streaming(
+                pool,
+                text,
+                session_id,
+                token,
+                chat_id,
+                model=load_model(),
+                agent_mode=summarize_mode,
+                send_message=send_message,
+                send_chat_action=send_chat_action,
+                collapse_blank_lines=collapse_blank_lines,
+                send_pending_attachments=send_pending_attachments,
+                send_pending_images=send_pending_images,
+                logs_dir=LOGS_DIR,
             )
-        if batch_document_paths:
-            text += "\n\n[User sent %d file(s). They are in the workspace at: %s. Read the file(s) and respond accordingly.]" % (
-                len(batch_document_paths),
-                ", ".join(batch_document_paths),
+            session_id = run_result.session_id
+            save_session(session_id)
+            if summarize_mode:
+                record_user_text = ""
+            elif command_texts:
+                record_user_text = "\n\n".join(non_command_texts) if non_command_texts else ""
+            else:
+                record_user_text = "\n\n".join(batch_texts) if batch_texts else ""
+            sessions.record_exchange(
+                SESSIONS_FILE,
+                session_id,
+                user_text=record_user_text,
+                assistant_text=run_result.assistant_text,
+                session_file=SESSION_FILE,
             )
-
-        if not text.strip():
-            continue
-
-        summarize_mode = "ask" if command_texts and any(
-            parse_telegram_command(t) and parse_telegram_command(t)[0] == "summarize" for t in command_texts
-        ) else None
-
-        if command_texts:
-            print("Running agent after command(s): %s..." % ", ".join(command_texts[:3]), file=sys.stderr)
-        elif len(batch_texts) > 1:
-            print("Running agent for %d messages as one prompt (%s...)..." % (len(batch_texts), text[:50]), file=sys.stderr)
-        else:
-            print("Running agent for prompt: %s..." % text[:60], file=sys.stderr)
-        send_chat_action(token, chat_id, "typing")
-        run_result = run_agent_streaming(
-            text, session_id, token, chat_id, agent_mode=summarize_mode
-        )
-        session_id = run_result.session_id
-        save_session(session_id)
-        if summarize_mode:
-            record_user_text = ""
-        elif command_texts:
-            record_user_text = "\n\n".join(non_command_texts) if non_command_texts else ""
-        else:
-            record_user_text = "\n\n".join(batch_texts) if batch_texts else ""
-        sessions.record_exchange(
-            SESSIONS_FILE,
-            session_id,
-            user_text=record_user_text,
-            assistant_text=run_result.assistant_text,
-            session_file=SESSION_FILE,
-        )
+    finally:
+        pool.close_all()
 
 
 if __name__ == "__main__":

@@ -1,8 +1,10 @@
 # Copy to 'config' and fill in. Do not commit 'config' (it's in .gitignore).
 # TELEGRAM_BOT_TOKEN=your_bot_token_from_botfather
 # TELEGRAM_ALLOWED_USER_ID=your_telegram_user_id
+# CURSOR_API_KEY=your_cursor_api_key   (from Cursor dashboard; required for SDK)
 # CURSOR_AGENT_TIMEOUT=0     (optional; seconds before agent run is killed; 0 = unlimited, default)
 
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_ALLOWED_USER_ID=
+CURSOR_API_KEY=
 CURSOR_AGENT_TIMEOUT=0

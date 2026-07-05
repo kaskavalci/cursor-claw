@@ -1,13 +1,14 @@
 # User service: run due reminders (invoked by telegram-reminders.timer).
 # Install: copy to ~/.config/systemd/user/ together with telegram-reminders.timer.
 # Enable timer: systemctl --user enable --now telegram-reminders.timer
+# Requires: uv sync in repo root (cursor-sdk in .venv)
 
 [Unit]
-Description=Send due Telegram reminders (Cursor)
+Description=Send due Telegram reminders (Cursor SDK)
 
 [Service]
 Type=oneshot
 WorkingDirectory=%h/projects/cursor-claw
-ExecStart=/usr/bin/python3 %h/projects/cursor-claw/telegram-bot/run_reminders.py
+ExecStart=%h/projects/cursor-claw/.venv/bin/python %h/projects/cursor-claw/telegram-bot/run_reminders.py
 StandardOutput=journal
 StandardError=journal

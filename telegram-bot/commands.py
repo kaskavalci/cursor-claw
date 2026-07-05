@@ -2,11 +2,11 @@
 from __future__ import annotations
 
 import re
-import shutil
-import subprocess
 import os
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
+
+from cursor_sdk import Cursor
 
 import sessions
 
@@ -19,10 +19,7 @@ SUMMARIZE_PROMPT = (
     "Do not start new work."
 )
 
-_SESSION_ID_RE = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-    re.IGNORECASE,
-)
+_SESSION_ID_RE = re.compile(r"^(agent|bc)-[0-9a-f-]+$", re.IGNORECASE)
 
 KNOWN_COMMANDS = frozenset({"new", "summarize", "help", "status", "resume", "model", "chats"})
 
@@ -59,7 +56,7 @@ HELP_TEXT = """Commands:
 /chats — list saved conversations (title + summary)
 /chats <page> — paginated list
 /resume <number> — switch to chat from /chats list
-/resume <session-id> — switch by full UUID
+/resume <session-id> — switch by full agent id (agent-…)
 /summarize — summarize the current conversation (read-only)
 /status — show current session id
 /model — show current model and latest per provider
@@ -68,43 +65,38 @@ HELP_TEXT = """Commands:
 /help — this message"""
 
 
-def create_chat_session(repo_root: str) -> str:
-    # create-chat is a subcommand on the `agent` binary, not a prompt to `cursor agent`
-    agent_bin = shutil.which("agent") or "agent"
-    out = subprocess.run(
-        [agent_bin, "create-chat"],
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-        timeout=90,
-    )
-    if out.returncode != 0:
-        raise RuntimeError(out.stderr.strip() or "create-chat failed")
-    session_id = out.stdout.strip()
-    if not session_id:
-        raise RuntimeError("create-chat returned empty id")
-    return session_id
+def create_chat_session(agent_pool: Any, model: str) -> str:
+    return agent_pool.create_session(model=model)
 
 
-def list_available_models(repo_root: str) -> str:
-    agent_bin = shutil.which("agent") or "agent"
-    out = subprocess.run(
-        [agent_bin, "models"],
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    if out.returncode != 0:
-        raise RuntimeError(out.stderr.strip() or "agent models failed")
-    text = out.stdout.strip()
-    if not text:
-        raise RuntimeError("agent models returned empty list")
-    return text
+def _validate_resume(agent_pool: Any, sid: str) -> bool:
+    """Return True if the SDK session can be resumed."""
+    if agent_pool is None:
+        return True
+    return agent_pool.warm(sid)
+
+
+def fetch_available_models(api_key: str | None = None) -> Dict[str, str]:
+    """Return {slug: display_name} from cursor-sdk (same auth as agent runs)."""
+    try:
+        sdk_models = Cursor.models.list(api_key=api_key)
+    except Exception as e:
+        raise RuntimeError(f"could not list models: {e}") from e
+    if not sdk_models:
+        raise RuntimeError("model list returned empty")
+    return {m.id: m.display_name for m in sdk_models}
+
+
+def format_full_model_list(models: Dict[str, str], current_model: str | None = None) -> str:
+    lines = ["Available models", ""]
+    for slug, label in models.items():
+        suffix = " (current)" if current_model and slug == current_model else ""
+        lines.append(f"{slug} - {label}{suffix}")
+    return "\n".join(lines)
 
 
 def parse_models_output(raw: str) -> Dict[str, str]:
-    """Parse `agent models` lines into {slug: label}."""
+    """Parse legacy `agent models` CLI lines into {slug: label} (tests only)."""
     models: Dict[str, str] = {}
     for line in raw.splitlines():
         line = line.strip()
@@ -287,8 +279,9 @@ def handle_commands(
     session_file: str = "",
     sessions_file: str = "",
     model_file: str = "",
-    default_model: str = "Auto",
+    default_model: str = "auto",
     repo_root: str = ".",
+    agent_pool: Any = None,
 ) -> CommandResult:
     agent_prompt: Optional[str] = None
     handled = False
@@ -336,7 +329,7 @@ def handle_commands(
                 send_message(
                     token,
                     chat_id,
-                    "Usage: /resume <number> or /resume <full-uuid>",
+                    "Usage: /resume <number> or /resume <agent-id>",
                     use_rich=False,
                 )
             elif session_arg.isdigit():
@@ -355,10 +348,47 @@ def handle_commands(
                         )
                     else:
                         sid = entry.id
-                        sessions.set_active(
-                            sessions_file, sid, session_file=session_file
-                        )
-                        _write_active_session(session_file, sid)
+                        if not _validate_resume(agent_pool, sid):
+                            send_message(
+                                token,
+                                chat_id,
+                                "Session expired or not found on the server. Send /new to start.",
+                                use_rich=False,
+                            )
+                        else:
+                            sessions.set_active(
+                                sessions_file, sid, session_file=session_file
+                            )
+                            _write_active_session(session_file, sid)
+                            short_id = sid[:8] + "…"
+                            send_message(
+                                token,
+                                chat_id,
+                                f"Resumed: {entry.title} ({short_id})",
+                                use_rich=False,
+                            )
+            elif not _SESSION_ID_RE.match(session_arg):
+                send_message(
+                    token,
+                    chat_id,
+                    "Invalid session id. Use /chats for numbers or paste the full agent id (agent-…).",
+                    use_rich=False,
+                )
+            else:
+                sid = session_arg
+                if not _validate_resume(agent_pool, sid):
+                    send_message(
+                        token,
+                        chat_id,
+                        "Session expired or not found on the server. Send /new to start.",
+                        use_rich=False,
+                    )
+                elif sessions_file:
+                    entry = sessions.set_active(
+                        sessions_file, sid, session_file=session_file
+                    )
+                    _write_active_session(session_file, sid)
+                    if entry:
                         short_id = sid[:8] + "…"
                         send_message(
                             token,
@@ -366,35 +396,17 @@ def handle_commands(
                             f"Resumed: {entry.title} ({short_id})",
                             use_rich=False,
                         )
-            elif not _SESSION_ID_RE.match(session_arg):
-                send_message(
-                    token,
-                    chat_id,
-                    "Invalid session id. Use /chats for numbers or paste the full UUID.",
-                    use_rich=False,
-                )
-            else:
-                sid = session_arg
-                if sessions_file:
-                    entry = sessions.set_active(
-                        sessions_file, sid, session_file=session_file
-                    )
+                    else:
+                        send_message(token, chat_id, f"Resumed session: {sid}", use_rich=False)
                 else:
-                    entry = None
-                _write_active_session(session_file, sid)
-                if entry:
-                    short_id = sid[:8] + "…"
-                    send_message(
-                        token,
-                        chat_id,
-                        f"Resumed: {entry.title} ({short_id})",
-                        use_rich=False,
-                    )
-                else:
+                    _write_active_session(session_file, sid)
                     send_message(token, chat_id, f"Resumed session: {sid}", use_rich=False)
         elif name == "new":
             try:
-                sid = create_chat_session(repo_root)
+                if agent_pool is None:
+                    raise RuntimeError("Agent pool not configured")
+                current_model = read_model(model_file, default_model)
+                sid = create_chat_session(agent_pool, current_model)
                 title = sessions.truncate_text(args, sessions.TITLE_MAX) if args else "New chat"
                 if sessions_file:
                     sessions.register(
@@ -420,8 +432,8 @@ def handle_commands(
             if arg_lower in ("all", "full"):
                 current = read_model(model_file, default_model)
                 try:
-                    available = list_available_models(repo_root)
-                    text = f"Current model: {current}\n\n{available}"
+                    models = fetch_available_models()
+                    text = f"Current model: {current}\n\n{format_full_model_list(models, current)}"
                 except Exception as e:
                     text = f"Current model: {current}\n\n(Could not list models: {e})"
                 send_message(token, chat_id, text, use_rich=False)
@@ -442,8 +454,7 @@ def handle_commands(
             else:
                 current = read_model(model_file, default_model)
                 try:
-                    raw = list_available_models(repo_root)
-                    models = parse_models_output(raw)
+                    models = fetch_available_models()
                     text = f"Current model: {current}\n\n{format_short_model_list(models)}"
                 except Exception as e:
                     text = f"Current model: {current}\n\n(Could not list models: {e})"

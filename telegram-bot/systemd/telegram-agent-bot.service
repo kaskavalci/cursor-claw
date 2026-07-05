@@ -1,4 +1,4 @@
-# User service: Telegram bot that forwards messages to Cursor agent.
+# User service: Telegram bot that forwards messages to Cursor agent (cursor-sdk).
 # Install: copy to ~/.config/systemd/user/
 #   cp telegram-bot/systemd/telegram-agent-bot.service ~/.config/systemd/user/
 # Then edit the paths below if your repo is not in ~/projects/cursor-claw.
@@ -6,16 +6,17 @@
 #   loginctl enable-linger $USER
 # Start:
 #   systemctl --user enable --now telegram-agent-bot.service
+# After code updates: uv sync in repo root, then systemctl --user restart telegram-agent-bot.service
 
 [Unit]
-Description=Telegram agent bot (Cursor)
+Description=Telegram agent bot (Cursor SDK)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 WorkingDirectory=%h/projects/cursor-claw
-ExecStart=/usr/bin/python3 %h/projects/cursor-claw/telegram-bot/agent_bot.py
+ExecStart=%h/projects/cursor-claw/.venv/bin/python %h/projects/cursor-claw/telegram-bot/agent_bot.py
 Restart=always
 RestartSec=10
 

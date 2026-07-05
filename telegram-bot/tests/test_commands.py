@@ -5,12 +5,17 @@ from unittest.mock import MagicMock, patch
 
 from commands import (
     CommandResult,
+    fetch_available_models,
+    format_full_model_list,
     format_short_model_list,
     handle_commands,
     parse_models_output,
     parse_telegram_command,
     select_recommended_models,
 )
+
+SDK_SESSION_A = "agent-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+SDK_SESSION_B = "agent-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 
 
 class TestParseTelegramCommand(unittest.TestCase):
@@ -42,35 +47,37 @@ class TestHandleCommands(unittest.TestCase):
 
     def test_new_creates_session(self):
         send = MagicMock()
-        with patch("commands.subprocess.run") as run:
-            run.return_value = MagicMock(returncode=0, stdout="uuid-new-session\n", stderr="")
-            with tempfile.TemporaryDirectory() as tmp:
-                session_file = os.path.join(tmp, ".cursor_agent_session")
-                sessions_file = os.path.join(tmp, "sessions.json")
-                result = handle_commands(
-                    ["/new"], session_id=None, token="t", chat_id=1,
-                    send_message=send, session_file=session_file,
-                    sessions_file=sessions_file, repo_root=tmp,
-                )
-                self.assertEqual(result.session_id, "uuid-new-session")
-                self.assertTrue(os.path.isfile(session_file))
-                with open(session_file) as f:
-                    self.assertEqual(f.read(), "uuid-new-session")
-                self.assertTrue(os.path.isfile(sessions_file))
+        mock_pool = MagicMock()
+        mock_pool.create_session.return_value = SDK_SESSION_A
+        with tempfile.TemporaryDirectory() as tmp:
+            session_file = os.path.join(tmp, ".cursor_agent_session")
+            sessions_file = os.path.join(tmp, "sessions.json")
+            result = handle_commands(
+                ["/new"], session_id=None, token="t", chat_id=1,
+                send_message=send, session_file=session_file,
+                sessions_file=sessions_file, repo_root=tmp,
+                agent_pool=mock_pool,
+            )
+            self.assertEqual(result.session_id, SDK_SESSION_A)
+            self.assertTrue(os.path.isfile(session_file))
+            with open(session_file) as f:
+                self.assertEqual(f.read(), SDK_SESSION_A)
+            self.assertTrue(os.path.isfile(sessions_file))
 
     def test_new_with_args_sets_agent_prompt(self):
         send = MagicMock()
-        with patch("commands.subprocess.run") as run:
-            run.return_value = MagicMock(returncode=0, stdout="uuid\n", stderr="")
-            result = handle_commands(
-                ["/new fix it"], session_id="old", token="t", chat_id=1,
-                send_message=send, session_file=os.devnull, repo_root=".",
-            )
+        mock_pool = MagicMock()
+        mock_pool.create_session.return_value = SDK_SESSION_A
+        result = handle_commands(
+            ["/new fix it"], session_id="old", token="t", chat_id=1,
+            send_message=send, session_file=os.devnull, repo_root=".",
+            agent_pool=mock_pool,
+        )
         self.assertEqual(result.agent_prompt, "fix it")
 
     def test_status_shows_full_id(self):
         send = MagicMock()
-        sid = "82158677-e29c-4718-b123-456789abcdef"
+        sid = SDK_SESSION_A
         result = handle_commands(["/status"], session_id=sid, token="t", chat_id=1, send_message=send)
         self.assertTrue(result.handled)
         send.assert_called_once()
@@ -78,7 +85,7 @@ class TestHandleCommands(unittest.TestCase):
 
     def test_resume_switches_session(self):
         send = MagicMock()
-        sid = "82158677-e29c-4718-b123-456789abcdef"
+        sid = SDK_SESSION_A
         with tempfile.TemporaryDirectory() as tmp:
             session_file = os.path.join(tmp, ".cursor_agent_session")
             sessions_file = os.path.join(tmp, "sessions.json")
@@ -100,17 +107,41 @@ class TestHandleCommands(unittest.TestCase):
 
     def test_model_get_default(self):
         send = MagicMock()
-        raw = "Available models\n\nauto - Auto (current)\ngpt-5.2 - GPT-5.2\nclaude-opus-4-8-max - Opus 4.8 1M Max"
-        with patch("commands.list_available_models", return_value=raw):
+        models = {
+            "auto": "Auto",
+            "gpt-5.2": "GPT-5.2",
+            "claude-opus-4-8-max": "Opus 4.8 1M Max",
+        }
+        with patch("commands.fetch_available_models", return_value=models):
             result = handle_commands(
                 ["/model"], session_id="abc", token="t", chat_id=1, send_message=send, repo_root=".",
             )
         self.assertTrue(result.handled)
         body = send.call_args[0][2]
-        self.assertIn("Current model: Auto", body)
+        self.assertIn("Current model: auto", body)
         self.assertIn("Latest per provider:", body)
         self.assertIn("auto — Auto", body)
         self.assertNotIn("Available models", body)
+
+    def test_fetch_available_models_uses_sdk(self):
+        from cursor_sdk.types import SDKModel
+
+        mock_models = [
+            SDKModel(id="auto", display_name="Auto"),
+            SDKModel(id="gpt-5.2", display_name="GPT-5.2"),
+        ]
+        with patch("commands.Cursor") as mock_cursor:
+            mock_cursor.models.list.return_value = mock_models
+            result = fetch_available_models(api_key="test-key")
+        mock_cursor.models.list.assert_called_once_with(api_key="test-key")
+        self.assertEqual(result, {"auto": "Auto", "gpt-5.2": "GPT-5.2"})
+
+    def test_format_full_model_list_marks_current(self):
+        models = {"auto": "Auto", "gpt-5.2": "GPT-5.2"}
+        text = format_full_model_list(models, current_model="auto")
+        self.assertIn("auto - Auto (current)", text)
+        self.assertIn("gpt-5.2 - GPT-5.2", text)
+        self.assertNotIn("gpt-5.2 - GPT-5.2 (current)", text)
 
     def test_select_recommended_picks_newest_per_family(self):
         models = parse_models_output(
@@ -177,7 +208,7 @@ class TestHandleCommands(unittest.TestCase):
         from commands import SUMMARIZE_PROMPT
 
         send = MagicMock()
-        sid = "82158677-e29c-4718-b123-456789abcdef"
+        sid = SDK_SESSION_A
         result = handle_commands(["/summarize"], session_id=sid, token="t", chat_id=1, send_message=send)
         self.assertTrue(result.handled)
         self.assertEqual(result.agent_prompt, SUMMARIZE_PROMPT)
@@ -196,17 +227,17 @@ class TestHandleCommands(unittest.TestCase):
             import sessions as sessions_mod
 
             reg = sessions_mod.SessionRegistry(
-                active_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                active_id=SDK_SESSION_B,
                 sessions=[
                     sessions_mod.SessionEntry(
-                        id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                        id=SDK_SESSION_A,
                         created_at="2026-07-05T10:00:00",
                         last_active_at="2026-07-05T10:00:00",
                         title="First task",
                         summary="Did the first thing.",
                     ),
                     sessions_mod.SessionEntry(
-                        id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                        id=SDK_SESSION_B,
                         created_at="2026-07-05T11:00:00",
                         last_active_at="2026-07-05T11:00:00",
                         title="Second task",
@@ -216,7 +247,7 @@ class TestHandleCommands(unittest.TestCase):
             )
             sessions_mod.save_registry(sessions_file, reg)
             result = handle_commands(
-                ["/chats"], session_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                ["/chats"], session_id=SDK_SESSION_B,
                 token="t", chat_id=1, send_message=send, sessions_file=sessions_file,
             )
         self.assertTrue(result.handled)
@@ -245,16 +276,16 @@ class TestHandleCommands(unittest.TestCase):
             import sessions as sessions_mod
 
             reg = sessions_mod.SessionRegistry(
-                active_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                active_id=SDK_SESSION_B,
                 sessions=[
                     sessions_mod.SessionEntry(
-                        id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                        id=SDK_SESSION_A,
                         created_at="2026-07-05T11:00:00",
                         last_active_at="2026-07-05T11:00:00",
                         title="Recent",
                     ),
                     sessions_mod.SessionEntry(
-                        id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                        id=SDK_SESSION_B,
                         created_at="2026-07-05T10:00:00",
                         last_active_at="2026-07-05T10:00:00",
                         title="Older",
@@ -263,11 +294,11 @@ class TestHandleCommands(unittest.TestCase):
             )
             sessions_mod.save_registry(sessions_file, reg)
             result = handle_commands(
-                ["/resume 2"], session_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                ["/resume 2"], session_id=SDK_SESSION_B,
                 token="t", chat_id=1, send_message=send,
                 session_file=session_file, sessions_file=sessions_file,
             )
-            self.assertEqual(result.session_id, "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+            self.assertEqual(result.session_id, SDK_SESSION_B)
             with open(session_file) as f:
-                self.assertEqual(f.read(), "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+                self.assertEqual(f.read(), SDK_SESSION_B)
         self.assertIn("Older", send.call_args[0][2])
