@@ -67,9 +67,11 @@ Leave it running. When you send a text message to your bot on Telegram, it will 
 
 - `/new` — start a fresh Cursor agent session
 - `/new <prompt>` — new session, then run `<prompt>`
-- `/resume <session-id>` — switch back to a previous session (full UUID from `/status` or bot logs)
+- `/chats` — list saved conversations (title + summary); `/chats 2` for page 2
+- `/resume <number>` — switch to a chat from the `/chats` list
+- `/resume <session-id>` — switch by full UUID
 - `/summarize` — summarize the current conversation (ask mode; read-only, does not edit files)
-- `/status` — show the full current session id
+- `/status` — show the full current session id (and title when known)
 - `/model` — current model + latest top-tier pick per provider (auto-detected)
 - `/model all` — full list (~150 models)
 - `/model <slug>` — set model (e.g. `auto`, `gpt-5.2`)
@@ -98,7 +100,7 @@ When the agent needs to look something up on the web, prefer **[clawfox](https:/
 
 - The bot only accepts messages from the user ID in `config`; others are ignored.
 - It runs `cursor agent --print --trust --force --workspace <repo_root> ...` so the agent can execute commands without interactive prompts.
-- The agent session is persisted in `telegram-bot/.cursor_agent_session`, so restarts of the bot keep one continuous conversation.
+- The agent session is persisted in `telegram-bot/.cursor_agent_session` (active chat pointer). Multiple conversations are tracked in `telegram-bot/.cursor_agent_sessions.json` (titles and summaries updated after each exchange). Use `/chats` and `/resume` to switch between them.
 - Run the bot from the repo root so `--workspace` points at your clone; open that same folder in Cursor when you want to work there.
 
 ---
@@ -124,6 +126,8 @@ You can run the bot under systemd so it starts at boot and keeps running without
    systemctl --user enable --now telegram-agent-bot.service
    systemctl --user enable --now telegram-reminders.timer
    ```
+
+   Or use the Makefile from the repo root: `make systemd-install`, edit unit paths if needed, `loginctl enable-linger $USER`, then `make systemd-enable`. After code updates on a VPS: **`make deploy`** (pull + restart) or **`make bot-restart`** alone.
 
 Reminders are stored in `telegram-bot/reminders.json` (do not commit; it’s in `.gitignore`). Each entry has `"at"` (local time, `YYYY-MM-DDTHH:MM:SS`), and either `"text"` (fixed message sent at that time) or `"prompt"` (Cursor agent runs that prompt at that time and its reply is sent to you). The Cursor agent in this workspace can add reminders when you ask (e.g. “at 9am tomorrow check the BTC price and let me know”). You must have messaged the bot at least once so `telegram-bot/chat_id` exists.
 

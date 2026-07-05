@@ -8,6 +8,8 @@ import os
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
+import sessions
+
 # Only match /word at start — not /newbot
 _COMMAND_RE = re.compile(r"^/([a-zA-Z][a-zA-Z0-9_]*)((?:@[\w]+)?(?:\s+(.*))?|\s*)$", re.DOTALL)
 
@@ -22,7 +24,7 @@ _SESSION_ID_RE = re.compile(
     re.IGNORECASE,
 )
 
-KNOWN_COMMANDS = frozenset({"new", "summarize", "help", "status", "resume", "model"})
+KNOWN_COMMANDS = frozenset({"new", "summarize", "help", "status", "resume", "model", "chats"})
 
 _MODEL_NAME_RE = re.compile(r"^[\w.-]{1,64}$")
 
@@ -54,7 +56,10 @@ _FAMILY_ORDER: Dict[str, tuple[str, ...]] = {
 HELP_TEXT = """Commands:
 /new — start a fresh Cursor agent session
 /new <prompt> — new session, then run <prompt>
-/resume <session-id> — switch back to a previous session
+/chats — list saved conversations (title + summary)
+/chats <page> — paginated list
+/resume <number> — switch to chat from /chats list
+/resume <session-id> — switch by full UUID
 /summarize — summarize the current conversation (read-only)
 /status — show current session id
 /model — show current model and latest per provider
@@ -265,6 +270,13 @@ class CommandResult:
     handled: bool  # True if at least one command was recognized
 
 
+def _write_active_session(session_file: str, session_id: str) -> None:
+    if not session_file:
+        return
+    with open(session_file, "w") as f:
+        f.write(session_id)
+
+
 def handle_commands(
     batch_texts: List[str],
     *,
@@ -273,6 +285,7 @@ def handle_commands(
     chat_id: int,
     send_message: Callable[..., Any],
     session_file: str = "",
+    sessions_file: str = "",
     model_file: str = "",
     default_model: str = "Auto",
     repo_root: str = ".",
@@ -298,30 +311,99 @@ def handle_commands(
             send_message(token, chat_id, HELP_TEXT, use_rich=False)
         elif name == "status":
             if sid:
-                send_message(token, chat_id, f"Session: {sid}", use_rich=False)
+                msg = f"Session: {sid}"
+                if sessions_file:
+                    entry = sessions.get_entry(sessions_file, sid, session_file=session_file)
+                    if entry and entry.title not in ("New chat", "Imported session"):
+                        msg += f" — {entry.title}"
+                send_message(token, chat_id, msg, use_rich=False)
             else:
                 send_message(token, chat_id, "No active session. Send /new to start.", use_rich=False)
+        elif name == "chats":
+            if not sessions_file:
+                send_message(token, chat_id, "Session registry not configured.", use_rich=False)
+            else:
+                page = 1
+                if args.strip().isdigit():
+                    page = int(args.strip())
+                text = sessions.format_chats_list(
+                    sessions_file, session_file=session_file, page=page
+                )
+                send_message(token, chat_id, text, use_rich=False)
         elif name == "resume":
             session_arg = args.split()[0] if args else ""
             if not session_arg:
-                send_message(token, chat_id, "Usage: /resume <session-id>", use_rich=False)
+                send_message(
+                    token,
+                    chat_id,
+                    "Usage: /resume <number> or /resume <full-uuid>",
+                    use_rich=False,
+                )
+            elif session_arg.isdigit():
+                if not sessions_file:
+                    send_message(token, chat_id, "Session registry not configured.", use_rich=False)
+                else:
+                    entry = sessions.resolve_by_index(
+                        sessions_file, int(session_arg), session_file=session_file
+                    )
+                    if not entry:
+                        send_message(
+                            token,
+                            chat_id,
+                            f"No chat #{session_arg}. Send /chats to list sessions.",
+                            use_rich=False,
+                        )
+                    else:
+                        sid = entry.id
+                        sessions.set_active(
+                            sessions_file, sid, session_file=session_file
+                        )
+                        _write_active_session(session_file, sid)
+                        short_id = sid[:8] + "…"
+                        send_message(
+                            token,
+                            chat_id,
+                            f"Resumed: {entry.title} ({short_id})",
+                            use_rich=False,
+                        )
             elif not _SESSION_ID_RE.match(session_arg):
                 send_message(
                     token,
                     chat_id,
-                    "Invalid session id. Paste the full UUID (from /status or bot logs).",
+                    "Invalid session id. Use /chats for numbers or paste the full UUID.",
                     use_rich=False,
                 )
             else:
                 sid = session_arg
-                with open(session_file, "w") as f:
-                    f.write(sid)
-                send_message(token, chat_id, f"Resumed session: {sid}", use_rich=False)
+                if sessions_file:
+                    entry = sessions.set_active(
+                        sessions_file, sid, session_file=session_file
+                    )
+                else:
+                    entry = None
+                _write_active_session(session_file, sid)
+                if entry:
+                    short_id = sid[:8] + "…"
+                    send_message(
+                        token,
+                        chat_id,
+                        f"Resumed: {entry.title} ({short_id})",
+                        use_rich=False,
+                    )
+                else:
+                    send_message(token, chat_id, f"Resumed session: {sid}", use_rich=False)
         elif name == "new":
             try:
                 sid = create_chat_session(repo_root)
-                with open(session_file, "w") as f:
-                    f.write(sid)
+                title = sessions.truncate_text(args, sessions.TITLE_MAX) if args else "New chat"
+                if sessions_file:
+                    sessions.register(
+                        sessions_file,
+                        sid,
+                        title=title,
+                        session_file=session_file,
+                    )
+                _write_active_session(session_file, sid)
                 send_message(token, chat_id, "New session started.", use_rich=False)
                 if args:
                     agent_prompt = args

@@ -5,6 +5,7 @@
 # Telegram bot: secrets and session state
 telegram-bot/config
 telegram-bot/.cursor_agent_session
+telegram-bot/.cursor_agent_sessions.json
 telegram-bot/.cursor_agent_model
 telegram-bot/chat_id
 telegram-bot/.telegram_offset

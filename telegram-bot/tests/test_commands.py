@@ -46,14 +46,17 @@ class TestHandleCommands(unittest.TestCase):
             run.return_value = MagicMock(returncode=0, stdout="uuid-new-session\n", stderr="")
             with tempfile.TemporaryDirectory() as tmp:
                 session_file = os.path.join(tmp, ".cursor_agent_session")
+                sessions_file = os.path.join(tmp, "sessions.json")
                 result = handle_commands(
                     ["/new"], session_id=None, token="t", chat_id=1,
-                    send_message=send, session_file=session_file, repo_root=tmp,
+                    send_message=send, session_file=session_file,
+                    sessions_file=sessions_file, repo_root=tmp,
                 )
                 self.assertEqual(result.session_id, "uuid-new-session")
                 self.assertTrue(os.path.isfile(session_file))
                 with open(session_file) as f:
                     self.assertEqual(f.read(), "uuid-new-session")
+                self.assertTrue(os.path.isfile(sessions_file))
 
     def test_new_with_args_sets_agent_prompt(self):
         send = MagicMock()
@@ -78,14 +81,16 @@ class TestHandleCommands(unittest.TestCase):
         sid = "82158677-e29c-4718-b123-456789abcdef"
         with tempfile.TemporaryDirectory() as tmp:
             session_file = os.path.join(tmp, ".cursor_agent_session")
+            sessions_file = os.path.join(tmp, "sessions.json")
             result = handle_commands(
                 [f"/resume {sid}"], session_id="other-id", token="t", chat_id=1,
-                send_message=send, session_file=session_file, repo_root=tmp,
+                send_message=send, session_file=session_file,
+                sessions_file=sessions_file, repo_root=tmp,
             )
             self.assertEqual(result.session_id, sid)
             with open(session_file) as f:
                 self.assertEqual(f.read(), sid)
-        self.assertIn(sid, send.call_args[0][2])
+        self.assertIn("Resumed", send.call_args[0][2])
 
     def test_resume_requires_id(self):
         send = MagicMock()
@@ -176,9 +181,93 @@ class TestHandleCommands(unittest.TestCase):
         result = handle_commands(["/summarize"], session_id=sid, token="t", chat_id=1, send_message=send)
         self.assertTrue(result.handled)
         self.assertEqual(result.agent_prompt, SUMMARIZE_PROMPT)
+
     def test_summarize_requires_session(self):
         send = MagicMock()
         result = handle_commands(["/summarize"], session_id=None, token="t", chat_id=1, send_message=send)
         self.assertTrue(result.handled)
         self.assertIsNone(result.agent_prompt)
         self.assertIn("No active session", send.call_args[0][2])
+
+    def test_chats_lists_sessions(self):
+        send = MagicMock()
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions_file = os.path.join(tmp, "sessions.json")
+            import sessions as sessions_mod
+
+            reg = sessions_mod.SessionRegistry(
+                active_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                sessions=[
+                    sessions_mod.SessionEntry(
+                        id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                        created_at="2026-07-05T10:00:00",
+                        last_active_at="2026-07-05T10:00:00",
+                        title="First task",
+                        summary="Did the first thing.",
+                    ),
+                    sessions_mod.SessionEntry(
+                        id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                        created_at="2026-07-05T11:00:00",
+                        last_active_at="2026-07-05T11:00:00",
+                        title="Second task",
+                        summary="Did the second thing.",
+                    ),
+                ],
+            )
+            sessions_mod.save_registry(sessions_file, reg)
+            result = handle_commands(
+                ["/chats"], session_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                token="t", chat_id=1, send_message=send, sessions_file=sessions_file,
+            )
+        self.assertTrue(result.handled)
+        body = send.call_args[0][2]
+        self.assertIn("Your chats (2)", body)
+        self.assertIn("First task", body)
+        self.assertIn("Second task", body)
+        self.assertIn("(active)", body)
+
+    def test_chats_empty(self):
+        send = MagicMock()
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions_file = os.path.join(tmp, "sessions.json")
+            result = handle_commands(
+                ["/chats"], session_id=None, token="t", chat_id=1,
+                send_message=send, sessions_file=sessions_file,
+            )
+        self.assertTrue(result.handled)
+        self.assertIn("No chats yet", send.call_args[0][2])
+
+    def test_resume_by_index(self):
+        send = MagicMock()
+        with tempfile.TemporaryDirectory() as tmp:
+            session_file = os.path.join(tmp, ".cursor_agent_session")
+            sessions_file = os.path.join(tmp, "sessions.json")
+            import sessions as sessions_mod
+
+            reg = sessions_mod.SessionRegistry(
+                active_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                sessions=[
+                    sessions_mod.SessionEntry(
+                        id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                        created_at="2026-07-05T11:00:00",
+                        last_active_at="2026-07-05T11:00:00",
+                        title="Recent",
+                    ),
+                    sessions_mod.SessionEntry(
+                        id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                        created_at="2026-07-05T10:00:00",
+                        last_active_at="2026-07-05T10:00:00",
+                        title="Older",
+                    ),
+                ],
+            )
+            sessions_mod.save_registry(sessions_file, reg)
+            result = handle_commands(
+                ["/resume 2"], session_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                token="t", chat_id=1, send_message=send,
+                session_file=session_file, sessions_file=sessions_file,
+            )
+            self.assertEqual(result.session_id, "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+            with open(session_file) as f:
+                self.assertEqual(f.read(), "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+        self.assertIn("Older", send.call_args[0][2])

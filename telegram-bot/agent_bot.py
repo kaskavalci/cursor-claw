@@ -3,8 +3,8 @@
 Telegram bot: only accepts messages from the allowed user (see config); forwards
 them to Cursor agent and sends the agent's response back. Accepts photos and file
 attachments (e.g. PDF); files are saved under telegram-bot/received_documents/.
-Uses --output-format stream-json
-and --resume to keep one conversation session across restarts (session_id stored in
+Uses --output-format stream-json and --resume for multi-session conversations
+(session registry in .cursor_agent_sessions.json; active session pointer in
 .cursor_agent_session). All other users are dropped.
 
 Config: create telegram-bot/config from config.example with TELEGRAM_BOT_TOKEN and
@@ -20,8 +20,11 @@ import subprocess
 import threading
 import urllib.request
 import urllib.error
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, Tuple
+
+import sessions
 
 TYPING_INTERVAL = 4  # Telegram typing indicator lasts ~5s; re-send before it expires
 RICH_CHUNK = 32768  # sendRichMessage limit
@@ -34,6 +37,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(SCRIPT_DIR)
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "config")
 SESSION_FILE = os.path.join(SCRIPT_DIR, ".cursor_agent_session")
+SESSIONS_FILE = os.path.join(SCRIPT_DIR, ".cursor_agent_sessions.json")
 MODEL_FILE = os.path.join(SCRIPT_DIR, ".cursor_agent_model")
 CHAT_ID_FILE = os.path.join(SCRIPT_DIR, "chat_id")
 OFFSET_FILE = os.path.join(SCRIPT_DIR, ".telegram_offset")
@@ -364,6 +368,12 @@ def save_offset(offset: int) -> None:
         print("Could not save offset: %s" % e, file=sys.stderr)
 
 
+@dataclass
+class AgentRunResult:
+    session_id: Optional[str]
+    assistant_text: str
+
+
 def _parse_session_and_final_output(full_stdout: str, full_stderr: str, returncode: int) -> Tuple[str, Optional[str]]:
     """Parse full stdout for session_id and final displayable result. Returns (response_text, session_id)."""
     session_id = None
@@ -407,17 +417,17 @@ def run_agent_streaming(
     chat_id: int,
     *,
     agent_mode: Optional[str] = None,
-) -> Optional[str]:
+) -> AgentRunResult:
     """
     Run agent with stream-json: ignore "thinking" and "result". Send
     every assistant message as a Telegram message (no --stream-partial-output,
     so each message is a full turn). Skip whitespace-only. Typing indicator
     until process done. Raw JSON stream written to telegram-bot/logs/<timestamp>.log.
-    Returns session_id for persistence.
+    Returns session_id and last assistant text for registry updates.
     """
     if not prompt.strip():
         send_message(token, chat_id, "(no prompt)", use_rich=False)
-        return resume_session
+        return AgentRunResult(session_id=resume_session, assistant_text="")
     agent_bin = shutil.which("agent") or "agent"
     cmd = [
         agent_bin, "--print", "--trust", "--force",
@@ -433,6 +443,7 @@ def run_agent_streaming(
     timeout_sec = get_agent_timeout()
     full_stdout_lines = []
     full_stderr_lines = []
+    last_assistant_ref: list[str] = [""]
     lock = threading.Lock()
     process_done = threading.Event()
     proc_ref = [None]  # so main thread can kill on timeout
@@ -497,6 +508,8 @@ def run_agent_streaming(
                             continue
                         to_send = text.strip()
                         if to_send:
+                            with lock:
+                                last_assistant_ref[0] = to_send
                             send_pending_attachments(token, chat_id)
                             send_pending_images(token, chat_id)
                             send_message(token, chat_id, collapse_blank_lines(to_send))
@@ -536,12 +549,16 @@ def run_agent_streaming(
     response_text, session_id = _parse_session_and_final_output(full_stdout, full_stderr, 0)
     if not session_id:
         session_id = resume_session
-    return session_id
+    last_assistant_text = last_assistant_ref[0]
+    if not last_assistant_text and response_text and response_text != "(no output)":
+        last_assistant_text = response_text
+    return AgentRunResult(session_id=session_id, assistant_text=last_assistant_text)
 
 
 def register_bot_commands(token: str) -> None:
     commands = [
         {"command": "new", "description": "Start a new agent session"},
+        {"command": "chats", "description": "List agent conversations"},
         {"command": "resume", "description": "Resume a previous session by id"},
         {"command": "summarize", "description": "Summarize current conversation"},
         {"command": "status", "description": "Show session id"},
@@ -561,6 +578,9 @@ def main():
     if offset:
         print("Resuming from update offset %s." % offset, file=sys.stderr)
     session_id = load_session()
+    registry = sessions.load_registry(SESSIONS_FILE, session_file=SESSION_FILE)
+    if session_id and registry.active_id != session_id:
+        sessions.set_active(SESSIONS_FILE, session_id, session_file=SESSION_FILE)
     if session_id:
         print("Resuming session: %s..." % session_id[:20], file=sys.stderr)
     print("Agent bot running. Only user_id=%s accepted; others dropped." % allowed_user_id, file=sys.stderr)
@@ -646,6 +666,7 @@ def main():
                 chat_id=chat_id,
                 send_message=send_message,
                 session_file=SESSION_FILE,
+                sessions_file=SESSIONS_FILE,
                 model_file=MODEL_FILE,
                 default_model=DEFAULT_AGENT_MODEL,
                 repo_root=REPO_ROOT,
@@ -689,10 +710,24 @@ def main():
         else:
             print("Running agent for prompt: %s..." % text[:60], file=sys.stderr)
         send_chat_action(token, chat_id, "typing")
-        session_id = run_agent_streaming(
+        run_result = run_agent_streaming(
             text, session_id, token, chat_id, agent_mode=summarize_mode
         )
+        session_id = run_result.session_id
         save_session(session_id)
+        if summarize_mode:
+            record_user_text = ""
+        elif command_texts:
+            record_user_text = "\n\n".join(non_command_texts) if non_command_texts else ""
+        else:
+            record_user_text = "\n\n".join(batch_texts) if batch_texts else ""
+        sessions.record_exchange(
+            SESSIONS_FILE,
+            session_id,
+            user_text=record_user_text,
+            assistant_text=run_result.assistant_text,
+            session_file=SESSION_FILE,
+        )
 
 
 if __name__ == "__main__":
