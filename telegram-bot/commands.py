@@ -1,7 +1,6 @@
 """Telegram slash commands for agent_bot."""
 from __future__ import annotations
 
-import os
 import re
 import subprocess
 from dataclasses import dataclass
